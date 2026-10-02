@@ -12,6 +12,19 @@ class RateLimitReason(enum.Enum):
     ENDPOINT_RATE_EXCEEDED = "endpoint_rate_exceeded"
 
 
+class QuotaReason(enum.Enum):
+    """周期总量额度拒绝原因。"""
+
+    QUOTA_EXHAUSTED = "quota_exhausted"
+
+
+class BillingRejectReason(enum.Enum):
+    """计费与幂等相关的拒绝原因。"""
+
+    DECLARED_COST_MALFORMED = "declared_cost_malformed"
+    REQUEST_IN_FLIGHT = "request_in_flight"
+
+
 class VersionRejectReason(enum.Enum):
     """版本协商拒绝原因。"""
 
@@ -81,3 +94,47 @@ class CircuitOpen(GatewayError):
     def __init__(self, *, retry_after: float) -> None:
         self.retry_after = retry_after
         super().__init__("circuit breaker is open", detail={"retry_after": retry_after})
+
+
+class QuotaExhausted(GatewayError):
+    """客户在当前周期的总量额度已用完（区别于"速度太快"）。"""
+
+    status_code = 429
+
+    def __init__(
+        self,
+        reason: QuotaReason,
+        *,
+        retry_after: float,
+        detail: dict | None = None,
+    ) -> None:
+        self.quota_reason = reason
+        self.retry_after = retry_after
+        super().__init__(
+            f"quota exhausted: {reason.value}",
+            detail={"retry_after": retry_after, **(detail or {})},
+        )
+        self.reason = reason.value
+
+
+class BillingRejected(GatewayError):
+    """计费参数非法或幂等冲突（请求尚未发生，不扣任何额度）。"""
+
+    status_code = 400
+
+    def __init__(
+        self,
+        reason: BillingRejectReason,
+        *,
+        retry_after: float = 0.0,
+        detail: dict | None = None,
+    ) -> None:
+        self.billing_reason = reason
+        self.retry_after = retry_after
+        if reason is BillingRejectReason.REQUEST_IN_FLIGHT:
+            self.status_code = 409
+        super().__init__(
+            f"billing rejected: {reason.value}",
+            detail={"retry_after": retry_after, **(detail or {})},
+        )
+        self.reason = reason.value
