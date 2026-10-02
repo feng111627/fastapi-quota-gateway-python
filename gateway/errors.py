@@ -10,6 +10,7 @@ class RateLimitReason(enum.Enum):
 
     CLIENT_RATE_EXCEEDED = "client_rate_exceeded"
     ENDPOINT_RATE_EXCEEDED = "endpoint_rate_exceeded"
+    QUOTA_EXHAUSTED = "quota_exhausted"  # 周期总额度已用完（区别于"速度太快"）
 
 
 class VersionRejectReason(enum.Enum):

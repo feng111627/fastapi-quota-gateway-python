@@ -88,10 +88,12 @@ class MultiLevelRateLimiter:
         client_policy: RateLimitPolicy,
         endpoint_policies: dict[str, RateLimitPolicy],
         *,
+        client_policy_resolver: Callable[[str], RateLimitPolicy] | None = None,
         state_path: str | None = None,
         clock: Callable[[], float] | None = None,
     ) -> None:
         self._client_policy = client_policy
+        self._client_policy_resolver = client_policy_resolver
         self._endpoint_policies = dict(endpoint_policies)
         self._state_path = state_path
         self._clock = clock or time.monotonic
@@ -101,23 +103,29 @@ class MultiLevelRateLimiter:
         if state_path:
             self._load(state_path)
 
-    def _new_client_bucket(self) -> TokenBucket:
+    def _new_client_bucket(self, client_id: str) -> TokenBucket:
+        # 有解析器时按客户分档取策略（新桶生效；存量桶不追溯调整）
+        policy = (
+            self._client_policy_resolver(client_id)
+            if self._client_policy_resolver
+            else self._client_policy
+        )
         return TokenBucket(
-            capacity=float(self._client_policy.burst),
-            rate_per_sec=self._client_policy.rate_per_sec,
+            capacity=float(policy.burst),
+            rate_per_sec=policy.rate_per_sec,
         )
 
     def _new_endpoint_bucket(self, endpoint: str) -> TokenBucket:
         policy = self._endpoint_policies[endpoint]
         return TokenBucket(capacity=float(policy.burst), rate_per_sec=policy.rate_per_sec)
 
-    def check(self, client_id: str, endpoint: str) -> LimitDecision:
-        """原子地完成"检查 + 扣减"；失败时回滚已扣令牌。"""
+    def check(self, client_id: str, endpoint: str, cost: float = 1.0) -> LimitDecision:
+        """原子地完成"检查 + 扣减 cost 个令牌"；失败时回滚已扣令牌。"""
         now = self._clock()
         with self._lock:
             client_bucket = self._client_buckets.get(client_id)
             if client_bucket is None:
-                client_bucket = self._client_buckets[client_id] = self._new_client_bucket()
+                client_bucket = self._client_buckets[client_id] = self._new_client_bucket(client_id)
 
             endpoint_bucket = None
             if endpoint in self._endpoint_policies:
@@ -127,13 +135,13 @@ class MultiLevelRateLimiter:
 
             # 先在不提交的情况下检查各级（try_consume 会直接改状态，故记录快照以便回滚）
             client_before = (client_bucket.tokens, client_bucket.last_refill)
-            ok_client, wait_client = client_bucket.try_consume(now)
+            ok_client, wait_client = client_bucket.try_consume(now, cost)
 
             endpoint_before = None
             ok_endpoint, wait_endpoint = True, 0.0
             if endpoint_bucket is not None:
                 endpoint_before = (endpoint_bucket.tokens, endpoint_bucket.last_refill)
-                ok_endpoint, wait_endpoint = endpoint_bucket.try_consume(now)
+                ok_endpoint, wait_endpoint = endpoint_bucket.try_consume(now, cost)
 
             if ok_client and ok_endpoint:
                 return LimitDecision(allowed=True)
@@ -155,6 +163,23 @@ class MultiLevelRateLimiter:
                 reason=RateLimitReason.CLIENT_RATE_EXCEEDED,
                 retry_after=round(wait_client, 3),
             )
+
+    def refund(self, client_id: str, endpoint: str, cost: float = 1.0) -> None:
+        """归还 cost 个令牌（不超过容量）。
+
+        用于后续环节（如总额度不足）拒绝时补偿本次已扣的速率预算，
+        使同一客户端反复被同一原因拦截时结论可复现。
+        """
+        now = self._clock()
+        with self._lock:
+            client_bucket = self._client_buckets.get(client_id)
+            if client_bucket is not None:
+                client_bucket._refill(now)
+                client_bucket.tokens = min(client_bucket.capacity, client_bucket.tokens + cost)
+            endpoint_bucket = self._endpoint_buckets.get(endpoint)
+            if endpoint_bucket is not None:
+                endpoint_bucket._refill(now)
+                endpoint_bucket.tokens = min(endpoint_bucket.capacity, endpoint_bucket.tokens + cost)
 
     def snapshot(self) -> None:
         """把当前桶状态持久化到 state_path（若配置）。原子写入避免半截文件。"""
