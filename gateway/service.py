@@ -1,12 +1,24 @@
-"""接入层编排：限流 -> 版本协商 -> 熔断保护的上游调用。"""
+"""接入层编排。
+
+包含两代入口，判定顺序各自固定、互不影响：
+- ``Gateway``：原多级限流 -> 版本协商 -> 熔断 -> 上游；
+- ``QuotaGateway``：分档计费（代价解析 -> 幂等/预占 -> 版本 -> 熔断 -> 上游）。
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Callable, TypeVar
 
+from .billing import CostResolver
 from .circuitbreaker import CircuitBreaker
-from .errors import RateLimitExceeded
+from .errors import (
+    CircuitOpen,
+    RateLimitExceeded,
+    UpstreamError,
+    UpstreamFailureKind,
+)
+from .gate import AccountingGate, ReplayDirective
 from .ratelimit import MultiLevelRateLimiter
 from .versioning import NegotiationResult, VersionRegistry
 
@@ -61,14 +73,6 @@ class Gateway:
 # ---------------------------------------------------------------------------
 # 分档计费网关
 # ---------------------------------------------------------------------------
-
-from .billing import CostResolver
-from .errors import (  # noqa: E402
-    CircuitOpen,
-    UpstreamError,
-    UpstreamFailureKind,
-)
-from .gate import AccountingGate, ReplayDirective  # noqa: E402
 
 
 @dataclass(frozen=True)
