@@ -15,23 +15,18 @@ from fastapi.responses import JSONResponse
 from gateway import (
     AccountingGate,
     ApiVersion,
-    BillingRejected,
     CircuitBreaker,
     CircuitBreakerConfig,
-    CircuitOpen,
     CostResolver,
     EndpointCostPolicy,
     GatewayError,
     Plan,
     PlanRegistry,
-    QuotaExhausted,
     QuotaGateway,
     QuotaResetMode,
-    RateLimitExceeded,
     UpstreamError,
     UpstreamFailureKind,
     VersionRegistry,
-    VersionRejected,
     VersionRule,
 )
 
