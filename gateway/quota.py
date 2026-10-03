@@ -4,6 +4,12 @@
 - 窗口：按 UTC 自然日（DAILY）或固定周期秒数（ROLLING）滚动重置。
 - 幂等：按 (client_id, request_id) 记账，同一编号重试不重复扣、不重复退；
   记录带窗口标记，跨窗口自动失效。
+- 账本三态机（_LedgerEntry.state）：
+  - IN_FLIGHT：已扣减、调用结果未定，只有这一态允许退还；
+  - COMMITTED：上游成功或业务错误（照常计费），占用永久确定，
+    后续同编号重试无论成败都不得改动这笔额度；
+  - REFUNDED：可退失败已退还，同编号再来视为新一轮扣减。
+  commit/refund 都只对 IN_FLIGHT 生效且各自只迁移一次，并发下幂等。
 - 持久化：已用额度、窗口起点、账本与客档映射原子写入 JSON，重启后接得上。
 """
 
@@ -70,12 +76,25 @@ class ChargeResult:
     retry_after: float = 0.0  # 拒绝时：距窗口重置的秒数
 
 
+class LedgerState(enum.Enum):
+    """账本条目状态机。"""
+
+    IN_FLIGHT = "in_flight"  # 已扣减，上游结果未定（唯一可退还态）
+    COMMITTED = "committed"  # 已成功完成（或业务错误照常计费），占用永久确定
+    REFUNDED = "refunded"  # 可退失败已退还，同编号再来按新一轮扣减
+
+
 @dataclass
 class _LedgerEntry:
     client_id: str
     cost: float
     window_start: float
-    refunded: bool = False
+    state: LedgerState = LedgerState.IN_FLIGHT
+
+    @property
+    def refunded(self) -> bool:
+        """兼容旧快照读取口径。"""
+        return self.state is LedgerState.REFUNDED
 
 
 @dataclass(frozen=True)
@@ -168,14 +187,16 @@ class TieredQuotaManager:
                     # 跨窗口的旧记录失效，按新请求处理
                     del self._ledger[key]
                     entry = None
-                if entry is not None and not entry.refunded:
+                if entry is not None and entry.state is not LedgerState.REFUNDED:
+                    # IN_FLIGHT（并发重试）或 COMMITTED（已成功）：
+                    # 本次不重复扣，且后续 commit/refund 都不会再动这笔账
                     return ChargeResult(
                         allowed=True,
                         status=self._status_locked(client_id, plan, account),
                         cost=entry.cost,
                         duplicate=True,
                     )
-                # entry.refunded 时视为新一轮扣减（重试上一已退还的请求）
+                # state is REFUNDED（或无记录）时视为新一轮扣减（重试上一已退还的请求）
 
             if account.used + cost > plan.quota_limit:
                 retry_after = account.window_start + plan.window_length() - now
@@ -195,20 +216,44 @@ class TieredQuotaManager:
                 allowed=True, status=self._status_locked(client_id, plan, account), cost=cost
             )
 
-    def refund(self, client_id: str, request_id: str) -> bool:
-        """按 request_id 幂等退还；返回是否真正发生了退还。"""
+    def commit(self, client_id: str, request_id: str) -> bool:
+        """把一笔在途扣减标记为 COMMITTED（请求已成功完成，照常计费）。
+
+        只有 IN_FLIGHT 的当前窗口记录会迁移；COMMITTED / REFUNDED 均为 no-op。
+        返回是否真正发生了状态迁移。提交后的占用不会再被任何同编号重试退掉。
+        """
         key = f"{client_id}:{request_id}"
         now = self._clock()
         with self._lock:
             entry = self._ledger.get(key)
-            if entry is None or entry.refunded:
+            if entry is None or entry.state is not LedgerState.IN_FLIGHT:
                 return False
-            entry.refunded = True
+            plan = self._plans[self._client_plans.get(client_id, self._default_plan)]
+            account = self._account_locked(client_id, plan, now)
+            if account.window_start != entry.window_start:
+                # 跨窗口的旧账：不迁移、不动新窗口账目
+                return False
+            entry.state = LedgerState.COMMITTED
+            return True
+
+    def refund(self, client_id: str, request_id: str) -> bool:
+        """按 request_id 幂等退还；返回是否真正发生了退还。
+
+        仅 IN_FLIGHT 的记录可退：COMMITTED（已成功）绝不退，
+        REFUNDED 不重复退；并发退还下恰好一人生效。
+        """
+        key = f"{client_id}:{request_id}"
+        now = self._clock()
+        with self._lock:
+            entry = self._ledger.get(key)
+            if entry is None or entry.state is not LedgerState.IN_FLIGHT:
+                return False
             plan = self._plans[self._client_plans.get(client_id, self._default_plan)]
             account = self._account_locked(client_id, plan, now)
             if account.window_start == entry.window_start:
                 account.used = max(0.0, account.used - entry.cost)
-            # 跨窗口的旧账不退还到新窗口，仅标记已退，防止重复退
+            # 无论是否同窗口都标记已退：跨窗口不把旧账退到新窗口，但防止重复退
+            entry.state = LedgerState.REFUNDED
             return True
 
     def refund_charge(self, client_id: str, cost: float) -> None:
@@ -246,7 +291,7 @@ class TieredQuotaManager:
                         "client_id": e.client_id,
                         "cost": e.cost,
                         "window_start": e.window_start,
-                        "refunded": e.refunded,
+                        "state": e.state.value,
                     }
                     for k, e in self._ledger.items()
                 },
@@ -268,12 +313,20 @@ class TieredQuotaManager:
             k: QuotaAccount(used=float(v["used"]), window_start=float(v["window_start"]))
             for k, v in data.get("accounts", {}).items()
         }
+        def _entry_state(v: dict) -> LedgerState:
+            raw = v.get("state")
+            if raw is not None:
+                return LedgerState(raw)
+            # 旧格式只有 refunded 布尔位：未退的在途记录按 COMMITTED 处理，
+            # 重启后已成功的重试结论不被后续重试推翻（宁可保守不退）
+            return LedgerState.REFUNDED if v.get("refunded") else LedgerState.COMMITTED
+
         self._ledger = {
             k: _LedgerEntry(
                 client_id=v["client_id"],
                 cost=float(v["cost"]),
                 window_start=float(v["window_start"]),
-                refunded=bool(v["refunded"]),
+                state=_entry_state(v),
             )
             for k, v in data.get("ledger", {}).items()
         }

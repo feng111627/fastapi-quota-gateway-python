@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from datetime import date
 
 import pytest
@@ -262,3 +263,189 @@ def test_success_response_carries_quota_view():
                 resp.quota.reset_at, resp.quota.cost)
     assert resp.quota.remaining == 9.0
     assert resp.quota.reset_at > 0
+
+
+def test_retry_after_success_then_timeout_keeps_quota():
+    """场景一：同一编号先成功占用，后续重试即使赶上上游超时也不改动额度。"""
+    # 熔断阈值调高，隔离变量：本场景只关注超时退还边界
+    gw, quota = make_gateway(
+        quota_limit=5,
+        breaker_config=CircuitBreakerConfig(failure_threshold=100, recovery_timeout=10.0),
+    )
+
+    resp = gw.handle("c1", "/x", None, lambda: "ok", request_id="same-id")
+    used_after_success = quota.status("c1").used
+    logger.info("input: first call request_id=same-id upstream=ok -> remaining=%s used=%s",
+                resp.quota.remaining, used_after_success)
+    assert used_after_success == 1.0
+
+    def timeout_upstream():
+        raise UpstreamError(UpstreamFailureKind.TIMEOUT, "retry hits upstream timeout")
+
+    for attempt in range(3):  # 连续多次同编号可退失败重试
+        with pytest.raises(UpstreamError) as exc_info:
+            gw.handle("c1", "/x", None, timeout_upstream, request_id="same-id")
+        logger.info(
+            "retry attempt=%d kind=%s -> refunded=%s used=%s remaining=%s",
+            attempt + 1, exc_info.value.kind.value,
+            exc_info.value.detail["quota"]["refunded"],
+            quota.status("c1").used, exc_info.value.detail["quota"]["remaining"],
+        )
+        assert exc_info.value.kind is UpstreamFailureKind.TIMEOUT
+        assert exc_info.value.detail["quota"]["refunded"] is False  # 不退别人的成功笔
+        assert quota.status("c1").used == 1.0  # 成功那笔额度原样还在
+        assert exc_info.value.detail["quota"]["remaining"] == 4.0
+
+    # 再来一次成功重试：仍不重复扣
+    resp2 = gw.handle("c1", "/x", None, lambda: "ok", request_id="same-id")
+    logger.info("success retry -> remaining=%s used=%s",
+                resp2.quota.remaining, quota.status("c1").used)
+    assert quota.status("c1").used == 1.0
+    assert resp2.quota.remaining == 4.0
+
+
+def test_retry_after_success_then_circuit_open_keeps_quota():
+    """同编号成功后重试撞上熔断降级：降级该退的是在途笔，已提交的成功笔不退。"""
+    # 熔断器注入可控时钟，精确安排"先成功 -> 再熔断 -> 后重试"的时序
+    breaker_clock = {"t": 0.0}
+    plans = {"free": QuotaPlan("free", rate_per_sec=1000.0, burst=1000, quota_limit=5)}
+    quota = TieredQuotaManager(plans, "free")
+    limiter = MultiLevelRateLimiter(
+        client_policy=RateLimitPolicy(rate_per_sec=1000.0, burst=1000),
+        endpoint_policies={},
+    )
+    versions = VersionRegistry(rules=[VersionRule(ApiVersion(1, 0))], today=date(2026, 6, 1))
+    breaker = CircuitBreaker(
+        CircuitBreakerConfig(failure_threshold=2, recovery_timeout=10.0),
+        clock=lambda: breaker_clock["t"],
+    )
+    gw = Gateway(limiter, versions, breaker, quota=quota)
+
+    def boom():
+        raise UpstreamError(UpstreamFailureKind.TIMEOUT)
+
+    # c2 把熔断器打到 OPEN，再经半开探测成功恢复（c2 的账目与 c1 隔离）
+    for i in range(2):
+        with pytest.raises(UpstreamError):
+            gw.handle("c2", "/x", None, boom, request_id=f"trip-{i}")
+    breaker_clock["t"] = 11.0
+    gw.handle("c2", "/x", None, lambda: "probe-ok", request_id="probe-close")
+
+    # c1 的同编号在 CLOSED 下成功并提交
+    gw.handle("c1", "/x", None, lambda: "ok", request_id="settled-id")
+    assert quota.status("c1").used == 1.0
+
+    # 再次把熔断打到 OPEN，且不推进时钟：重试只能撞上快速失败
+    for i in range(2):
+        with pytest.raises(UpstreamError):
+            gw.handle("c2", "/x", None, boom, request_id=f"retrip-{i}")
+    for attempt in range(2):
+        with pytest.raises(CircuitOpen) as exc_info:
+            gw.handle("c1", "/x", None, lambda: "ok", request_id="settled-id")
+        logger.info("circuit-open retry=%d -> status=503 refunded=%s used=%s remaining=%s",
+                    attempt + 1, exc_info.value.detail["quota"]["refunded"],
+                    quota.status("c1").used,
+                    exc_info.value.detail["quota"]["remaining"])
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.detail["quota"]["refunded"] is False
+        assert quota.status("c1").used == 1.0
+        assert exc_info.value.detail["quota"]["remaining"] == 4.0
+
+
+def test_concurrent_same_id_retries_no_crosstalk():
+    """场景二：同编号并发重试，成功与超时混杂时各笔账互不串扰。
+
+    同编号串行结算后结论确定：只要有一次尝试成功，最终占用恰好 1；
+    若全部超时则占用 0。绝不能出现"成功被并发超时退掉"的串账。
+    """
+    gw, quota = make_gateway(
+        quota_limit=5,
+        breaker_config=CircuitBreakerConfig(failure_threshold=100, recovery_timeout=10.0),
+    )
+    n = 24
+    barrier = threading.Barrier(n)  # 尽量让线程同时冲进网关
+    outcomes: list[str] = []
+    outcomes_lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        def upstream():
+            # 错峰放大交错：有人慢到超时、有人成功返回
+            time.sleep(0.002 * (i % 5))
+            if i % 2 == 0:
+                raise UpstreamError(UpstreamFailureKind.TIMEOUT)
+            return "ok"
+
+        barrier.wait()
+        try:
+            gw.handle("c1", "/x", None, upstream, request_id="race-id")
+            outcome = "ok"
+        except UpstreamError as exc:
+            outcome = f"timeout(refunded={exc.detail['quota']['refunded']})"
+        with outcomes_lock:
+            outcomes.append(outcome)
+        logger.info("thread=%02d request_id=race-id -> %s", i, outcome)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    used = quota.status("c1").used
+    ok_count = outcomes.count("ok")
+    logger.info("settled: ok=%d timeout=%d final_used=%s",
+                ok_count, len(outcomes) - ok_count, used)
+    assert ok_count >= 1  # 奇数号线程成功
+    assert used == 1.0  # 不是 0（成功笔没被退），也不是多次扣减
+    # 只可能有一次真实退还（首个在途超时），之后该编号已被成功提交
+    refunded_count = sum("refunded=True" in o for o in outcomes)
+    # 成功之后的超时重试全部 refunded=False；成功之前至多一笔真退
+    assert all(o in ("ok", "timeout(refunded=False)", "timeout(refunded=True)") for o in outcomes)
+    logger.info("refunded_once_among_retries count=%s VERDICT 无串账", refunded_count)
+
+
+def test_unsupported_version_repeated_conclusion_stable():
+    """场景三：版本不在支持范围被反复调用，原因/状态码/剩余额度稳定且无副作用。"""
+    # 速率预算故意给得很紧：若版本拒绝吃令牌，第 2 次就会退化成"请求太快"
+    plans = {"free": QuotaPlan("free", rate_per_sec=0.0001, burst=1, quota_limit=5)}
+    quota = TieredQuotaManager(plans, "free")
+    limiter = MultiLevelRateLimiter(
+        client_policy=RateLimitPolicy(rate_per_sec=0.0001, burst=1),
+        endpoint_policies={},
+    )
+    versions = VersionRegistry(rules=[VersionRule(ApiVersion(1, 0))], today=date(2026, 6, 1))
+    breaker = CircuitBreaker(CircuitBreakerConfig())
+    gw = Gateway(limiter, versions, breaker, quota=quota)
+
+    seen: list[tuple[str, int, float]] = []
+    upstream_called: list[int] = []
+    for attempt in range(5):
+        with pytest.raises(VersionRejected) as exc_info:
+            gw.handle(
+                "c1", "/x", "v9",
+                lambda: upstream_called.append(1),
+                request_id=f"badver-{attempt}",
+            )
+        seen.append((
+            exc_info.value.reason,
+            exc_info.value.status_code,
+            exc_info.value.detail["quota"]["remaining"],
+        ))
+        logger.info(
+            "attempt=%d input=(version=v9, request_id=badver-%d) "
+            "-> reason=%s status=%s remaining=%s upstream_called=%s",
+            attempt + 1, attempt, exc_info.value.reason, exc_info.value.status_code,
+            exc_info.value.detail["quota"]["remaining"], bool(upstream_called),
+        )
+        assert exc_info.value.reason == "version_too_new"
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail["quota"]["remaining"] == 5.0  # 额度也没被动
+    assert len(set(seen)) == 1  # 五次结论（原因、状态码、剩余额度）完全一致
+    assert not upstream_called  # 拒绝路径不触达上游
+
+    # 版本拒绝未吃掉速率预算：紧接着一个合法版本请求仍能正常通过
+    resp = gw.handle("c1", "/x", "v1", lambda: "ok", request_id="good-1")
+    logger.info("legal request after 5 rejections -> served, remaining=%s",
+                resp.quota.remaining)
+    assert resp.quota.remaining == 4.0
+    assert quota.status("c1").used == 1.0

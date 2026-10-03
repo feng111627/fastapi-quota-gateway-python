@@ -8,7 +8,10 @@
 - **按客户分档**：`TieredQuotaManager.set_client_plan(client_id, plan)` 可给单个客户调档；未单独配置的客户落到默认档。限流器通过 `client_policy_resolver` 按客户当前套餐建立令牌桶（新桶生效，存量桶不追溯调整）。
 - **总量窗口**：每个客户在每档下有独立账目（已用量 + 窗口起点）；窗口滚动时账目自动清零重计。
 - **原子扣减**：`charge` 的检查与扣减在同一把锁内完成，并发下不超发。
-- **状态恢复**：`snapshot()` 把客档映射、各客户账目、幂等账本原子写入 JSON（临时文件 + `os.replace`）；重启后已用额度接得上，同一请求编号仍不重复扣。
+- **账本三态机**：每个 `(client_id, request_id)` 的扣减记录在 `IN_FLIGHT`（已扣、结果未定）、`COMMITTED`（成功或业务错误，照常计费，占用永久确定）、`REFUNDED`（可退失败已退还）三态间单向迁移：
+  - 只有 `IN_FLIGHT` 可以退还；`COMMITTED` 任何后续同编号重试都退不掉，`REFUNDED` 不重复退；
+  - 成功或业务错误后由网关 `commit` 提交；超时/连接/降级时由网关 `refund` 退还，各自只迁移一次，并发下幂等。
+- **状态恢复**：`snapshot()` 把客档映射、各客户账目、幂等账本（含三态）原子写入 JSON（临时文件 + `os.replace`）；重启后已用额度、已提交/已退还的重试结论都接得上，同一请求编号仍不重复扣。
 - **拒绝原因可区分**："速度太快"（`client_rate_exceeded` / `endpoint_rate_exceeded`）与"额度用完"（`quota_exhausted`）是不同的 reason，均为 HTTP 429 + `Retry-After`。额度不足被拒时会归还已扣的速率令牌，因此同一客户反复拦截得到的结论稳定可复现。
 
 ## 权重与退还规则
@@ -16,17 +19,19 @@
 - **接口权重**：`CostPolicy(endpoint_weights={...})` 给接口配权重，未配置的接口用 `default_weight`。
 - **客户端声明**：请求可经 `X-Request-Cost` 声明本次要花的单位数；最终计费 = **接口权重 × 声明单位数**。
 - **越界处理规矩（唯一）**：声明超出 `[min_declared, max_declared]` 时**按边界夹取**（不拒绝、不轻信），响应中 `cost.clamped=true` 标明发生了夹取；未声明时按 `min_declared` 计。权重同时作用于速率令牌扣减与总额度扣减。
-- **失败退还**：请求因**上游超时、连接失败、或撞上熔断降级**而没拿到数据时，本次扣减全额退还（`detail.quota.refunded=true`）。上游业务错误（5xx）照常计费、不退还。
+- **失败退还边界（固定，不随重试变化）**：只有**上游超时、连接失败、撞上熔断降级**这类确实没拿到数据的失败才退还本次在途扣减（`detail.quota.refunded=true`），同一笔只退一次；**上游业务错误（5xx）照常计费、不退还**，并立即提交占用。
 - **重试幂等**：客户端在 `X-Request-Id` 携带请求编号。
   - 同一编号重复请求：只扣一次（`duplicate`），不重复扣；
-  - 同一编号的退还只生效一次，并发重试不串账（账本键为 `client_id + request_id`）；
-  - 已退还的编号再次请求视为新一轮扣减；账本记录跨窗口自动失效；
+  - **已成功完成的请求占用永久确定**：首次成功（或业务错误）后记录进入 `COMMITTED`，之后同编号重试即使赶上超时或熔断降级，也只对重试自己做结论，**绝不会把前面成功那笔额度退回去**（退还返回 `refunded=false`，剩余额度不变）；
+  - **并发同编号重试互不串扰**：网关对同一 `(client_id, request_id)` 的"扣减→调用→结算"整段串行化，配合三态账本，各笔重试不能互相提交或退还，最终账目要么恰好一笔占用、要么全额已退；
+  - 同一编号的退还只生效一次；已退还（`REFUNDED`）的编号再次请求视为新一轮扣减；账本记录跨窗口自动失效；
   - 不带编号的请求：失败退还在同一调用路径内同步补偿，天然只发生一次。
 
 ## 降级与额度对外约定
 
 - **判定顺序固定**：限流 → 版本协商 → 额度扣减 → 熔断 → 上游调用。任何并发时序下结论一致。
-- **降级不打上游**：熔断 OPEN 期间快速失败（503 `circuit_open` + `Retry-After` 即恢复等待时间），不触达上游；半开探测逻辑不受影响。
+- **拒绝路径不留副作用**：版本协商失败（版本过旧/过新/格式非法，HTTP 400）在额度扣减之前结束，不触达上游，并**归还本步已扣的速率令牌**；因此同一个不受支持的版本反复调用，返回的原因、状态码、`Retry-After` 口径与剩余额度完全稳定，不会因为多调几次而退化成"请求太快"（429）。额度不足拒绝同样归还速率令牌（见上）。
+- **降级不打上游**：熔断 OPEN 期间快速失败（503 `circuit_open` + `Retry-After` 即恢复等待时间），不触达上游；半开探测逻辑不受影响。降级退还的只是本次在途扣减；若该编号此前已 `COMMITTED`，则 `refunded=false`、成功笔额度不动。
 - **统一响应口径**：正常响应与各类拒绝（限流 / 额度 / 版本 / 降级）都携带额度视图：
   - 成功：响应体 `quota={plan, limit, remaining, reset_at, cost}`、`cost={applied, weight, declared, clamped}`，响应头 `X-Quota-Limit` / `X-Quota-Remaining` / `X-Quota-Reset`；
   - 拒绝：错误体 `detail.quota={plan, limit, remaining, reset_at}`（失败退还时另带 `refunded`），同样的 `X-Quota-*` 响应头；`Retry-After` 在 429/503 上给出建议等待时间。
@@ -77,7 +82,7 @@
 
 - `Gateway` 的 `quota` / `costs` 参数可缺省，缺省时行为与旧版完全一致（无总额度、按 1 次计费、无退还）。
 - 原有拒绝原因、状态码、`Retry-After` 语义不变；新增 `quota_exhausted` 原因与 `X-Quota-*` 响应头为纯增量。
-- 限流快照文件格式不变；配额账目使用独立的快照文件，互不影响。
+- 限流快照文件格式不变；配额账目使用独立的快照文件，互不影响。配额账本快照由旧的 `refunded` 布尔位升级为 `state` 三态字段，旧快照可自动读取（未退的在途记录按 `committed` 保守接续，避免重启后误退成功笔）。
 
 ## 本地验证
 
@@ -85,8 +90,16 @@
 # 安装依赖
 uv sync
 
-# 运行全部测试（日志会打印每个请求的输入与判定依据）
+# 运行全部测试（日志按用例打印所属业务模块 CASE START、
+# 每条用例的输入与判定依据、以及 CASE END verdict=PASSED/FAILED）
 uv run pytest -q
+# 只看本轮修复相关的三类场景 + 熔断边界：
+uv run pytest -q tests/test_quota.py::test_committed_charge_never_refunded_by_later_retry \
+  tests/test_quota.py::test_committed_state_restored_after_restart \
+  tests/test_gateway_quota.py::test_retry_after_success_then_timeout_keeps_quota \
+  tests/test_gateway_quota.py::test_retry_after_success_then_circuit_open_keeps_quota \
+  tests/test_gateway_quota.py::test_concurrent_same_id_retries_no_crosstalk \
+  tests/test_gateway_quota.py::test_unsupported_version_repeated_conclusion_stable
 
 # 启动服务
 uv run python main.py
@@ -94,6 +107,29 @@ uv run python main.py
 # 手动验证
 curl -i -H 'X-Client-Id: demo' -H 'X-Api-Version: v1' -H 'X-Request-Id: r1' http://127.0.0.1:8000/api/data
 curl -i -H 'X-Client-Id: demo' -H 'X-Request-Cost: 999' http://127.0.0.1:8000/api/data   # 观察 cost.clamped
-UPSTREAM_MODE=timeout uv run python main.py   # 连续 3 次后观察 503 circuit_open 且额度被退还
+
+# 场景一：同编号先成功，再用同编号重试赶上上游超时 —— 成功笔的剩余额度不再被退回去
+curl -s -H 'X-Client-Id: demo' -H 'X-Request-Id: fixed-id' http://127.0.0.1:8000/api/data   # 剩余 999
+UPSTREAM_MODE=timeout curl -s -H 'X-Client-Id: demo' -H 'X-Request-Id: fixed-id' \
+  http://127.0.0.1:8000/api/data   # detail.quota.refunded=false，剩余仍为 999
+
+# 场景三：不支持的版本反复调用 —— 始终是 400 version_too_new，剩余额度不变，不会变成 429
+for i in 1 2 3 4 5; do
+  curl -s -o /dev/null -w '%{http_code} ' -H 'X-Client-Id: demo' -H 'X-Api-Version: v9' \
+    http://127.0.0.1:8000/api/data
+done; echo   # 输出：400 400 400 400 400
+
+UPSTREAM_MODE=timeout uv run python main.py   # 连续 3 次后观察 503 circuit_open 且在途额度被退还
 GATEWAY_CLIENT_PLANS='demo:premium' uv run python main.py   # 给 demo 客户单独调档
 ```
+
+对应自动化用例（覆盖输入、并发交错与最终账目判定）：
+
+| 业务场景 | 用例 |
+| --- | --- |
+| 同编号先成功后超时重试，额度不变、退还被拒 | `test_retry_after_success_then_timeout_keeps_quota` / `test_committed_charge_never_refunded_by_later_retry` |
+| 同编号成功后重试撞熔断降级，成功笔不退 | `test_retry_after_success_then_circuit_open_keeps_quota` |
+| 同编号并发重试（成功/超时混杂）不串账 | `test_concurrent_same_id_retries_no_crosstalk` / `test_concurrent_retry_same_id_no_cross_accounting` |
+| 反复调用不支持版本，原因/状态码/剩余额度稳定 | `test_unsupported_version_repeated_conclusion_stable` |
+| 业务错误照常计费不退 | `test_business_error_not_refunded` |
+| 重启后已提交/已退还结论接续 | `test_committed_state_restored_after_restart` / `test_state_restored_after_restart` |

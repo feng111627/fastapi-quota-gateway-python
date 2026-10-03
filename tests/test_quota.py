@@ -222,3 +222,58 @@ def test_ledger_entry_expires_across_windows():
     logger.info("next window same id: duplicate=%s used=%s", r.duplicate, m.status("c1").used)
     assert not r.duplicate
     assert m.status("c1").used == 4.0
+
+
+def test_committed_charge_never_refunded_by_later_retry():
+    """同一编号首次成功提交后，后续可退失败重试不得改动已确定的占用。"""
+    state, clock = make_clock()
+    m = make_manager(clock=clock)
+    first = m.charge("c1", 4.0, "req-ok")
+    committed = m.commit("c1", "req-ok")
+    used_after_commit = m.status("c1").used
+    logger.info("input: first charge=4.0 -> allowed=%s committed=%s used=%s",
+                first.allowed, committed, used_after_commit)
+    assert first.allowed and committed is True
+    assert used_after_commit == 4.0
+
+    # 同编号重试赶上"可退失败"：重复请求不重复扣，且退还被拒
+    retry = m.charge("c1", 4.0, "req-ok")
+    refund_by_retry = m.refund("c1", "req-ok")
+    used_after_retry = m.status("c1").used
+    logger.info("retry after success: duplicate=%s refund_accepted=%s used=%s",
+                retry.duplicate, refund_by_retry, used_after_retry)
+    assert retry.duplicate is True
+    assert refund_by_retry is False  # 已提交的成功占用绝不退
+    assert used_after_retry == 4.0  # 成功的那笔白不了
+
+    # 再退一次仍无效（只退一次的边界）
+    assert m.refund("c1", "req-ok") is False
+    assert m.status("c1").used == 4.0
+    logger.info("second refund -> refund_accepted=False used=%s VERDICT 占用不变",
+                m.status("c1").used)
+
+
+def test_committed_state_restored_after_restart(tmp_path):
+    """重启后已提交的结论接得上：同编号重试不重扣，也退不掉。"""
+    state, clock = make_clock()
+    path = str(tmp_path / "quota.json")
+    m = make_manager(clock=clock, state_path=path)
+    m.charge("c1", 5.0, "req-ok")
+    m.commit("c1", "req-ok")
+    # 另有一笔在途超时已退：重启后同编号应能按新一轮重扣
+    m.charge("c1", 2.0, "req-failed")
+    assert m.refund("c1", "req-failed") is True
+    m.snapshot()
+
+    m2 = make_manager(clock=clock, state_path=path)
+    logger.info("after restart: used=%s", m2.status("c1").used)
+    assert m2.status("c1").used == 5.0  # 成功笔占用仍在，已退笔不带回
+    dup = m2.charge("c1", 5.0, "req-ok")
+    assert dup.duplicate is True
+    assert m2.refund("c1", "req-ok") is False  # 已提交结论不被重启后的重试推翻
+    assert m2.status("c1").used == 5.0
+    retry = m2.charge("c1", 2.0, "req-failed")  # 已退编号按新一轮重扣
+    logger.info("refunded id retried after restart: duplicate=%s used=%s",
+                retry.duplicate, m2.status("c1").used)
+    assert retry.duplicate is False
+    assert m2.status("c1").used == 7.0
