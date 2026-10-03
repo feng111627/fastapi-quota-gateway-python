@@ -4,6 +4,9 @@
 - 窗口：按 UTC 自然日（DAILY）或固定周期秒数（ROLLING）滚动重置。
 - 幂等：按 (client_id, request_id) 记账，同一编号重试不重复扣、不重复退；
   记录带窗口标记，跨窗口自动失效。
+- 账本三态：pending（已扣、结果未知）/ committed（上游已成功，终态）/
+  refunded（可退失败已退，终态）。已 committed 的成功占用不会被后续同编号
+  重试的失败退还；退还后重试若成功，commit 时补扣，保证成功不白用。
 - 持久化：已用额度、窗口起点、账本与客档映射原子写入 JSON，重启后接得上。
 """
 
@@ -76,6 +79,7 @@ class _LedgerEntry:
     cost: float
     window_start: float
     refunded: bool = False
+    committed: bool = False  # 上游已成功：终态，任何后续重试都不得改动该占用
 
 
 @dataclass(frozen=True)
@@ -112,7 +116,9 @@ class TieredQuotaManager:
     """按客户分档的周期总额度管理器。
 
     - 未单独配置的客户落到 default_plan；set_client_plan 可单独调整。
-    - charge/refund 在同一把锁内完成，并发下不超发、不串账。
+    - charge/refund/commit 在同一把锁内完成，并发下不超发、不串账。
+    - 上游成功后须调用 commit 落定占用：已成功的编号不会被后续同编号
+      重试的失败退还（refund 对 committed 条目直接拒绝）。
     """
 
     def __init__(
@@ -169,13 +175,16 @@ class TieredQuotaManager:
                     del self._ledger[key]
                     entry = None
                 if entry is not None and not entry.refunded:
+                    # pending（结果未知）或 committed（已成功）：重试不重复扣。
+                    # committed 是终态，后续重试无论成败都不得改动该笔占用。
                     return ChargeResult(
                         allowed=True,
                         status=self._status_locked(client_id, plan, account),
                         cost=entry.cost,
                         duplicate=True,
                     )
-                # entry.refunded 时视为新一轮扣减（重试上一已退还的请求）
+                # entry.refunded 时视为新一轮扣减（重试上一已退还的请求）；
+                # 若这轮最终成功，commit 时会以新条目覆盖为 committed。
 
             if account.used + cost > plan.quota_limit:
                 retry_after = account.window_start + plan.window_length() - now
@@ -196,12 +205,19 @@ class TieredQuotaManager:
             )
 
     def refund(self, client_id: str, request_id: str) -> bool:
-        """按 request_id 幂等退还；返回是否真正发生了退还。"""
+        """按 request_id 幂等退还；返回是否真正发生了退还。
+
+        只退还"已扣但尚未成功"的一笔（pending）：
+        - 已 committed（该编号已有一笔上游成功）：拒绝退还，成功占用不被后续
+          同编号重试改动；
+        - 已 refunded：拒绝，保证同一笔只退一次；
+        - 跨窗口的旧账不退还到新窗口，仅标记已退，防止重复退。
+        """
         key = f"{client_id}:{request_id}"
         now = self._clock()
         with self._lock:
             entry = self._ledger.get(key)
-            if entry is None or entry.refunded:
+            if entry is None or entry.refunded or entry.committed:
                 return False
             entry.refunded = True
             plan = self._plans[self._client_plans.get(client_id, self._default_plan)]
@@ -209,6 +225,34 @@ class TieredQuotaManager:
             if account.window_start == entry.window_start:
                 account.used = max(0.0, account.used - entry.cost)
             # 跨窗口的旧账不退还到新窗口，仅标记已退，防止重复退
+            return True
+
+    def commit(self, client_id: str, request_id: str) -> bool:
+        """标记该编号的扣减对应上游已成功（终态，幂等）。
+
+        - pending -> committed：正常成功，占用保留；
+        - 已 committed：无操作，幂等返回；
+        - 已 refunded（本次重试先赶上可退失败被退、之后又成功）：补扣这笔代价，
+          并转回 committed——成功的请求不能白用，也不会留下可再退的口子。
+        返回本次是否发生了状态落定（已 committed 的重复成功返回 False）。
+        """
+        key = f"{client_id}:{request_id}"
+        now = self._clock()
+        with self._lock:
+            entry = self._ledger.get(key)
+            if entry is None:
+                return False
+            if entry.committed:
+                return False
+            was_refunded = entry.refunded
+            entry.refunded = False
+            entry.committed = True
+            if was_refunded:
+                plan = self._plans[self._client_plans.get(client_id, self._default_plan)]
+                account = self._account_locked(client_id, plan, now)
+                if account.window_start == entry.window_start:
+                    # 同窗口：退还后重试成功，把额度补扣回来，成功不白用
+                    account.used += entry.cost
             return True
 
     def refund_charge(self, client_id: str, cost: float) -> None:
@@ -247,6 +291,7 @@ class TieredQuotaManager:
                         "cost": e.cost,
                         "window_start": e.window_start,
                         "refunded": e.refunded,
+                        "committed": e.committed,
                     }
                     for k, e in self._ledger.items()
                 },
@@ -274,6 +319,8 @@ class TieredQuotaManager:
                 cost=float(v["cost"]),
                 window_start=float(v["window_start"]),
                 refunded=bool(v["refunded"]),
+                # 旧快照无该字段时按 pending 处理，语义与升级前一致
+                committed=bool(v.get("committed", False)),
             )
             for k, v in data.get("ledger", {}).items()
         }

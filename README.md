@@ -8,18 +8,21 @@
 - **按客户分档**：`TieredQuotaManager.set_client_plan(client_id, plan)` 可给单个客户调档；未单独配置的客户落到默认档。限流器通过 `client_policy_resolver` 按客户当前套餐建立令牌桶（新桶生效，存量桶不追溯调整）。
 - **总量窗口**：每个客户在每档下有独立账目（已用量 + 窗口起点）；窗口滚动时账目自动清零重计。
 - **原子扣减**：`charge` 的检查与扣减在同一把锁内完成，并发下不超发。
-- **状态恢复**：`snapshot()` 把客档映射、各客户账目、幂等账本原子写入 JSON（临时文件 + `os.replace`）；重启后已用额度接得上，同一请求编号仍不重复扣。
+- **状态恢复**：`snapshot()` 把客档映射、各客户账目、幂等账本（含 `committed` / `refunded` 终态）原子写入 JSON（临时文件 + `os.replace`）；重启后已用额度接得上，同一请求编号仍不重复扣，已成功编号在重启后重试超时依旧退不掉。
 - **拒绝原因可区分**："速度太快"（`client_rate_exceeded` / `endpoint_rate_exceeded`）与"额度用完"（`quota_exhausted`）是不同的 reason，均为 HTTP 429 + `Retry-After`。额度不足被拒时会归还已扣的速率令牌，因此同一客户反复拦截得到的结论稳定可复现。
+- **拒绝路径无副作用**：限流之后、额度扣减之前的任何拒绝都不留账——版本协商拒绝（HTTP 400）同样会把本轮已扣的速率令牌原样归还，也不扣总额度。因此用一个不被支持的版本连续请求任意多次，得到的 reason、状态码、`X-Quota-Remaining` 始终一致，不会因为"多来了几次"退化成 429。
 
 ## 权重与退还规则
 
 - **接口权重**：`CostPolicy(endpoint_weights={...})` 给接口配权重，未配置的接口用 `default_weight`。
 - **客户端声明**：请求可经 `X-Request-Cost` 声明本次要花的单位数；最终计费 = **接口权重 × 声明单位数**。
 - **越界处理规矩（唯一）**：声明超出 `[min_declared, max_declared]` 时**按边界夹取**（不拒绝、不轻信），响应中 `cost.clamped=true` 标明发生了夹取；未声明时按 `min_declared` 计。权重同时作用于速率令牌扣减与总额度扣减。
-- **失败退还**：请求因**上游超时、连接失败、或撞上熔断降级**而没拿到数据时，本次扣减全额退还（`detail.quota.refunded=true`）。上游业务错误（5xx）照常计费、不退还。
-- **重试幂等**：客户端在 `X-Request-Id` 携带请求编号。
+- **失败退还**：请求因**上游超时（`timeout`）、连接失败（`connection`）、或撞上熔断降级（`circuit_open`）**这类确实没拿到数据的失败时，本次扣减全额退还（`detail.quota.refunded=true`）。**边界不变**：上游业务错误（5xx，`business`）照常计费、不退还；速率/版本等本地拒绝不涉及退还。
+- **重试幂等**：客户端在 `X-Request-Id` 携带请求编号。账本按编号记三态——`pending`（已扣、上游结果未知）/ `committed`（上游已成功，终态）/ `refunded`（可退失败已退，终态）。
   - 同一编号重复请求：只扣一次（`duplicate`），不重复扣；
-  - 同一编号的退还只生效一次，并发重试不串账（账本键为 `client_id + request_id`）；
+  - **已成功不被退**：一个编号只要有一笔上游成功，即落定为 `committed`。之后用同一编号重试，哪怕这次赶上超时/连接/熔断，也**退不掉、也改动不了**前面成功那笔的占用（响应中 `refunded=false`，剩余额度不回弹）；
+  - **并发不串账**：同编号并发重试中，只有真正发起本轮扣减的那笔可能触发退还；`duplicate` 重试直接不进退还路径，加上 manager 对 `committed` 条目拒绝退还的双保险，各笔账目互不串扰、同一笔只退一次；
+  - **成功不白用**：一轮重试先超时被退、之后重试又成功时，`commit` 会把这笔额度补扣回来并落定为 `committed`；
   - 已退还的编号再次请求视为新一轮扣减；账本记录跨窗口自动失效；
   - 不带编号的请求：失败退还在同一调用路径内同步补偿，天然只发生一次。
 
@@ -85,8 +88,10 @@
 # 安装依赖
 uv sync
 
-# 运行全部测试（日志会打印每个请求的输入与判定依据）
-uv run pytest -q
+# 运行全部测试（日志逐行打印每个用例的输入与判定结果，可看出覆盖了哪些业务）
+uv run pytest                      # 实时日志：限流/版本/配额/熔断/退还各业务一目了然
+uv run pytest -q                   # 只看汇总
+uv run pytest tests/test_quota.py tests/test_gateway_quota.py -v   # 只跑账目相关
 
 # 启动服务
 uv run python main.py
@@ -96,4 +101,29 @@ curl -i -H 'X-Client-Id: demo' -H 'X-Api-Version: v1' -H 'X-Request-Id: r1' http
 curl -i -H 'X-Client-Id: demo' -H 'X-Request-Cost: 999' http://127.0.0.1:8000/api/data   # 观察 cost.clamped
 UPSTREAM_MODE=timeout uv run python main.py   # 连续 3 次后观察 503 circuit_open 且额度被退还
 GATEWAY_CLIENT_PLANS='demo:premium' uv run python main.py   # 给 demo 客户单独调档
+```
+
+### 三个灰度问题的本地复现
+
+```bash
+# 复现并验证修复（不依赖 HTTP，直接跑单测，日志含每次输入与判定）：
+uv run pytest tests/test_gateway_quota.py::test_success_then_timeout_retry_same_id_keeps_charge \
+              tests/test_gateway_quota.py::test_concurrent_same_id_success_and_timeout_do_not_cross_refund \
+              tests/test_gateway_quota.py::test_unsupported_version_repeated_is_stable_and_side_effect_free \
+              tests/test_quota.py::test_committed_entry_cannot_be_refunded_by_retry \
+              tests/test_quota.py::test_refunded_entry_recharged_when_retry_succeeds \
+              tests/test_quota.py::test_committed_outcome_restored_after_restart -s
+```
+
+1. **先成功后超时重试**：同一 `X-Request-Id` 第一次成功（占用 1 点），第二次起服务注入超时（`UPSTREAM_MODE=timeout`）。修复前错误响应的 `detail.quota.refunded=true` 且 `remaining` 回弹；修复后 `refunded=false`、`remaining` 保持首次成功后的值。
+2. **同编号并发重试**：多线程用同一编号并发，混合成功/超时。修复前成功笔可能被超时笔串退（`used` 变 0）；修复后 `used` 恰好等于成功笔数，超时笔一律 `refunded=false`（除非该编号此前无任何成功，则首笔可退失败正常退一次）。
+3. **不支持版本反复调用**：连续多次携带不支持的 `X-Api-Version`（如 `v9`）请求。修复前第 N 次会从 400 `version_too_new` 退化成 429 `client_rate_exceeded`；修复后始终是 400 + 同一 reason + 稳定的 `X-Quota-Remaining`。
+
+用 curl 复现第 3 个问题（服务启动后连打 8 次，结论应完全一致）：
+
+```bash
+for i in $(seq 8); do
+  curl -s -o /dev/null -w "%{http_code} " -H 'X-Client-Id: demo' -H 'X-Api-Version: v9' \
+    http://127.0.0.1:8000/api/data
+done; echo   # 修复后：400 400 400 400 400 400 400 400
 ```

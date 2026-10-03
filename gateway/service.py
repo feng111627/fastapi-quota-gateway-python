@@ -1,4 +1,4 @@
-"""接入层编排：限流 -> 版本协商 -> 额度扣减 -> 熔断保护的上游调用 -> 失败退还。"""
+"""接入层编排：限流 -> 版本协商 -> 额度扣减 -> 熔断保护的上游调用 -> 成功提交/失败退还。"""
 
 from __future__ import annotations
 
@@ -50,7 +50,10 @@ class Gateway:
     保证同一请求在任何并发时序下得到一致、可解释的结论。
 
     - 额度不足拒绝时归还已扣的速率令牌，反复拦截结论可复现。
-    - 上游超时/连接失败、熔断降级时退还本次额度（按 request_id 幂等）。
+    - 版本协商拒绝不留下任何副作用（速率令牌原样归还），反复调用结论一致。
+    - 上游成功后按 request_id 提交（committed 终态）：已成功的占用不会被
+      后续同编号重试的失败退还；并发重试各笔互不串账。
+    - 仅上游超时/连接失败、熔断降级退还本次额度，同一笔只退一次。
     - quota/costs 为 None 时行为与旧版完全一致。
     """
 
@@ -92,10 +95,11 @@ class Gateway:
                 detail=self._detail(client_id, endpoint, resolution),
             )
 
-        # 2. 版本协商（拒绝不消耗额度）
+        # 2. 版本协商（拒绝是纯判定，不留下任何副作用：归还已扣速率令牌）
         try:
             version = self._versions.negotiate(requested_version)
         except Exception as exc:
+            self._limiter.refund(client_id, endpoint, cost)
             self._attach_quota(exc, client_id)
             raise
 
@@ -126,10 +130,14 @@ class Gateway:
             exc.detail["quota"] = self._quota_view(client_id, charge, refunded)
             raise
 
+        # 5. 上游成功：落定本次占用。已成功的请求编号进入 committed 终态，
+        #    后续同编号重试即使赶上超时/连接/熔断失败，也退不掉这笔额度。
+        self._commit(client_id, request_id, charge)
+
         return GatewayResponse(
             body=body,
             version=version,
-            quota=self._quota_info(charge),
+            quota=self._quota_info(client_id, charge),
             cost=resolution,
         )
 
@@ -149,10 +157,33 @@ class Gateway:
     ) -> bool:
         if self._quota is None or charge is None or not charge.allowed:
             return False
+        if charge.duplicate:
+            # 本次只是同编号重试，占用属于另一笔（通常已成功）：
+            # 不退还，避免把别人/上一笔成功的额度退掉。
+            return False
         if request_id is not None:
             return self._quota.refund(client_id, request_id)
         self._quota.refund_charge(client_id, cost)
         return True
+
+    def _commit(
+        self,
+        client_id: str,
+        request_id: str | None,
+        charge: ChargeResult | None,
+    ) -> None:
+        """上游成功后落定占用。
+
+        duplicate 重试也要 commit：它是该逻辑请求"已有一笔成功"的权威信号，
+        可把仍处于 pending 的首笔记账（如首笔成功但落定前进程退出、重启恢复）
+        推进终态；对已 committed/refunded 条目的幂等语义由 manager 保证。
+        """
+        if self._quota is None or charge is None or not charge.allowed:
+            return
+        if request_id is not None:
+            self._quota.commit(client_id, request_id)
+            return
+        # 无 request_id：本次调用内同步完成，占用天然落定，无需账本动作
 
     def _quota_view(
         self, client_id: str, charge: ChargeResult | None, refunded: bool
@@ -168,14 +199,16 @@ class Gateway:
             "refunded": refunded,
         }
 
-    def _quota_info(self, charge: ChargeResult | None) -> QuotaInfo | None:
+    def _quota_info(self, client_id: str, charge: ChargeResult | None) -> QuotaInfo | None:
         if charge is None:
             return None
+        # commit 可能补扣（退还后重试成功），以最新账目为准构造成功视图
+        status = self._quota.status(client_id)
         return QuotaInfo(
-            plan=charge.status.plan,
-            limit=charge.status.limit,
-            remaining=charge.status.remaining,
-            reset_at=charge.status.reset_at,
+            plan=status.plan,
+            limit=status.limit,
+            remaining=status.remaining,
+            reset_at=status.reset_at,
             cost=charge.cost,
         )
 

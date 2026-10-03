@@ -212,6 +212,69 @@ def test_state_restored_after_restart(tmp_path):
     assert m2.status("c1").used == 7.0
 
 
+def test_committed_entry_cannot_be_refunded_by_retry():
+    """已成功（committed）的编号：重试返回 duplicate，任何失败都退不掉该笔。"""
+    state, clock = make_clock()
+    m = make_manager(clock=clock)
+    r1 = m.charge("c1", 4.0, "req-1")
+    assert r1.allowed
+    assert m.commit("c1", "req-1") is True  # 首笔上游成功，占用落定
+
+    r2 = m.charge("c1", 4.0, "req-1")  # 同编号重试（哪怕重试本身失败）
+    logger.info("retry after success: duplicate=%s used=%s", r2.duplicate, m.status("c1").used)
+    assert r2.duplicate and r2.allowed
+
+    # 重试赶上超时：拒绝退还，已成功的占用原样保留
+    assert m.refund("c1", "req-1") is False
+    # 重复 commit 也不产生新动作（并发成功重试互不干扰）
+    assert m.commit("c1", "req-1") is False
+    logger.info("refund after success -> refused, used=%s remaining=%s",
+                m.status("c1").used, m.status("c1").remaining)
+    assert m.status("c1").used == 4.0
+    assert m.status("c1").remaining == 6.0
+
+
+def test_refunded_entry_recharged_when_retry_succeeds():
+    """先超时退还、后重试成功：commit 时补扣，成功的请求不白用。"""
+    state, clock = make_clock()
+    m = make_manager(clock=clock)
+    m.charge("c1", 4.0, "req-1")
+    assert m.refund("c1", "req-1") is True
+    assert m.status("c1").used == 0.0
+
+    r = m.charge("c1", 4.0, "req-1")  # 退还后的新一轮重试
+    assert r.allowed and not r.duplicate
+    committed = m.commit("c1", "req-1")  # 这轮成功
+    s = m.status("c1")
+    logger.info("retry succeeds -> committed=%s used=%s remaining=%s",
+                committed, s.used, s.remaining)
+    assert committed is True
+    assert s.used == 4.0
+    # 已落定，之后再来失败重试也退不掉
+    assert m.refund("c1", "req-1") is False
+    assert m.status("c1").used == 4.0
+
+
+def test_committed_outcome_restored_after_restart(tmp_path):
+    """进程重启后：已成功的编号仍是 committed，重试超时退不掉、不重复扣。"""
+    state, clock = make_clock()
+    path = str(tmp_path / "quota.json")
+    m = make_manager(clock=clock, state_path=path)
+    m.charge("c1", 4.0, "req-1")
+    m.commit("c1", "req-1")
+    m.charge("c1", 2.0, "req-pending")  # 已扣尚未成功的也在账本里
+    m.snapshot()
+
+    m2 = make_manager(clock=clock, state_path=path)
+    logger.info("restart: used=%s", m2.status("c1").used)
+    assert m2.status("c1").used == 6.0
+    dup = m2.charge("c1", 4.0, "req-1")
+    assert dup.duplicate  # 已成功编号重试不重复扣
+    assert m2.refund("c1", "req-1") is False  # 成功占用跨重启仍受保护
+    assert m2.status("c1").used == 6.0
+    logger.info("restart retry timeout -> refund refused, used=%s", m2.status("c1").used)
+
+
 def test_ledger_entry_expires_across_windows():
     """跨窗口后旧编号记录失效，同编号按新请求扣减。"""
     state, clock = make_clock()

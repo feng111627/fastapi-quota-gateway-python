@@ -236,6 +236,107 @@ def test_concurrent_gateway_charge_and_refund():
     assert quota.status("c1").used == float(ok)  # 最终只有成功的占用额度
 
 
+def test_success_then_timeout_retry_same_id_keeps_charge():
+    """同一编号先成功后超时重试：成功那笔占用不被退，额度保持不变。"""
+    gw, quota = make_gateway(quota_limit=10)
+
+    resp = gw.handle("c1", "/x", None, lambda: "first-ok", request_id="order-1")
+    logger.info("first call -> success remaining=%s", resp.quota.remaining)
+    assert resp.quota.remaining == 9.0
+
+    def boom_timeout():
+        raise UpstreamError(UpstreamFailureKind.TIMEOUT, "retry hit upstream timeout")
+
+    with pytest.raises(UpstreamError) as exc_info:
+        gw.handle("c1", "/x", None, boom_timeout, request_id="order-1")
+    q = exc_info.value.detail["quota"]
+    logger.info("retry same id -> kind=timeout refunded=%s remaining=%s used=%s",
+                q["refunded"], q["remaining"], quota.status("c1").used)
+    assert q["refunded"] is False  # 重试是 duplicate，不能退成功那笔
+    assert q["remaining"] == 9.0  # 客户端看到的额度没有"变回去"
+    assert quota.status("c1").used == 1.0
+
+    # 再用新编号打一次超时：只退新的这一笔，老成功账依旧不动
+    with pytest.raises(UpstreamError) as exc_info2:
+        gw.handle("c1", "/x", None, boom_timeout, request_id="order-2")
+    q2 = exc_info2.value.detail["quota"]
+    logger.info("new id timeout -> refunded=%s remaining=%s used=%s",
+                q2["refunded"], q2["remaining"], quota.status("c1").used)
+    assert q2["refunded"] is True
+    assert quota.status("c1").used == 1.0  # 仍是成功那一笔
+    assert quota.status("c1").remaining == 9.0
+
+
+def test_concurrent_same_id_success_and_timeout_do_not_cross_refund():
+    """同一编号并发重试：一笔成功一笔超时，账目互不串扰，最终只算成功那笔。"""
+    gw, quota = make_gateway(quota_limit=10)
+    both_charged = threading.Event()
+    release = threading.Event()
+    outcomes: list[str] = []
+    lock = threading.Lock()
+
+    def upstream(role: str):
+        # 两个并发请求都进入上游（说明 charge 阶段都已完成）后再分别放行
+        if role == "success":
+            both_charged.set()
+            release.wait(timeout=2.0)
+            return "ok"
+        both_charged.wait(timeout=2.0)
+        release.wait(timeout=2.0)
+        raise UpstreamError(UpstreamFailureKind.TIMEOUT)
+
+    def worker(role: str) -> None:
+        try:
+            gw.handle("c1", "/x", None, lambda: upstream(role), request_id="same-concurrent")
+            outcome = "success"
+        except UpstreamError as exc:
+            outcome = f"timeout(refunded={exc.detail['quota']['refunded']})"
+        with lock:
+            outcomes.append(outcome)
+        logger.info("concurrent role=%s -> %s remaining=%s",
+                    role, outcome, quota.status("c1").remaining)
+
+    t_ok = threading.Thread(target=worker, args=("success",))
+    t_fail = threading.Thread(target=worker, args=("timeout",))
+    t_ok.start()
+    t_fail.start()
+    assert both_charged.wait(timeout=2.0)
+    release.set()
+    t_ok.join()
+    t_fail.join()
+
+    logger.info("concurrent outcomes=%s final used=%s remaining=%s",
+                outcomes, quota.status("c1").used, quota.status("c1").remaining)
+    assert "success" in outcomes
+    assert any("refunded=False" in o for o in outcomes)  # 超时那笔是 duplicate，未退成功账
+    assert quota.status("c1").used == 1.0  # 恰好一笔成功占用，没有被串退
+    assert quota.status("c1").remaining == 9.0
+
+
+def test_unsupported_version_repeated_is_stable_and_side_effect_free():
+    """不被支持的版本反复调用：原因/状态码/剩余额度稳定，且不消耗速率预算。"""
+    gw, quota = make_gateway(quota_limit=10)
+    # 速率突发容量很小：一旦版本拒绝吃掉令牌，第 6 次就会退化成 429
+    gw._limiter = MultiLevelRateLimiter(
+        client_policy=RateLimitPolicy(rate_per_sec=0.0001, burst=5),
+        endpoint_policies={},
+    )
+
+    seen: list[tuple[str, int, float]] = []
+    for attempt in range(8):
+        with pytest.raises(VersionRejected) as exc_info:
+            gw.handle("c1", "/x", "v9", lambda: "ok", request_id=f"badver-{attempt}")
+        remaining = exc_info.value.detail["quota"]["remaining"]
+        seen.append((exc_info.value.reason, exc_info.value.status_code, remaining))
+        logger.info("unsupported version attempt=%d -> status=%s reason=%s remaining=%s",
+                    attempt, exc_info.value.status_code, exc_info.value.reason, remaining)
+
+    assert all(reason == "version_too_new" for reason, _, _ in seen)
+    assert all(code == 400 for _, code, _ in seen)  # 不会退化成 429 "请求太快"
+    assert all(remaining == 10.0 for *_, remaining in seen)  # 额度视图也稳定
+    assert quota.status("c1").used == 0.0  # 版本拒绝不扣总额度
+
+
 def test_error_surface_consistent_across_rejections():
     """限流/版本/降级各类拒绝都带统一的额度视图。"""
     gw, quota = make_gateway(quota_limit=1)
